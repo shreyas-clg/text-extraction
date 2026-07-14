@@ -13,6 +13,7 @@ PDFs are digital (have a text layer), so text is extracted directly with
 pdfplumber - no OCR engine needed.
 """
 import argparse
+import glob
 import re
 import sys
 from pathlib import Path
@@ -139,24 +140,91 @@ def write_xlsx(rows_a, rows_b, out_path):
     wb.save(out_path)
 
 
+def discover_files(inputs, batch_folders=None, recursive=False):
+    """Scan and resolve all unique PDF files based on inputs and batch folders."""
+    files = []
+    seen = set()
+
+    def add_file(path):
+        try:
+            resolved = Path(path).resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                files.append(Path(path))
+        except Exception:
+            if path not in seen:
+                seen.add(path)
+                files.append(Path(path))
+
+    def scan_dir(dir_path):
+        pattern = "*.[pP][dD][fF]"
+        if recursive:
+            for p in Path(dir_path).rglob(pattern):
+                if p.is_file():
+                    add_file(p)
+        else:
+            for p in Path(dir_path).glob(pattern):
+                if p.is_file():
+                    add_file(p)
+
+    targets = []
+    if inputs:
+        targets.extend(inputs)
+    if batch_folders:
+        targets.extend(batch_folders)
+
+    for item in targets:
+        item_str = str(item)
+        if any(char in item_str for char in "*?[]"):
+            matched = glob.glob(item_str, recursive=recursive)
+            for m in matched:
+                p = Path(m)
+                if p.is_dir():
+                    scan_dir(p)
+                elif p.is_file():
+                    if p.suffix.lower() == ".pdf":
+                        add_file(p)
+            continue
+
+        p = Path(item)
+        if p.is_dir():
+            scan_dir(p)
+        elif p.is_file():
+            if p.suffix.lower() == ".pdf":
+                add_file(p)
+            else:
+                print(f"SKIP (not a PDF file): {p}", file=sys.stderr)
+        else:
+            print(f"SKIP (not found): {p}", file=sys.stderr)
+
+    return files
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Extract invoice fields to Excel.")
-    ap.add_argument("pdfs", nargs="+", help="PDF file(s)")
+    ap.add_argument("inputs", nargs="*", help="PDF file(s), folder(s), or glob pattern(s)")
+    ap.add_argument("-b", "--batch", "--folder", nargs="+", dest="batch_folders", help="Folder(s) to scan for PDF files automatically")
+    ap.add_argument("-r", "--recursive", action="store_true", help="Scan folders recursively")
     ap.add_argument("-o", "--output", default="output.xlsx", help="output .xlsx")
     args = ap.parse_args(argv)
 
+    if not args.inputs and not args.batch_folders:
+        ap.error("No input files or folders specified. Please provide at least one PDF file/glob or use --batch/--folder.")
+
+    pdf_paths = discover_files(args.inputs, args.batch_folders, args.recursive)
+    if not pdf_paths:
+        print("No PDF files were discovered for processing.", file=sys.stderr)
+        sys.exit(1)
+
     rows_a, rows_b = [], []
-    for p in args.pdfs:
-        if not Path(p).is_file():
-            print(f"SKIP (not found): {p}", file=sys.stderr)
-            continue
+    for p in pdf_paths:
         kind, row = process(p)
         if kind == "A":
             rows_a.append(row)
-            print(f"[A] {Path(p).name}: {row}")
+            print(f"[A] {p.name}: {row}")
         elif kind == "B":
             rows_b.append(row)
-            print(f"[B] {Path(p).name}: {row}")
+            print(f"[B] {p.name}: {row}")
         else:
             print(f"SKIP (unknown type): {p}", file=sys.stderr)
 
