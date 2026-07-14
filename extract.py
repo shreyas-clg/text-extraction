@@ -19,6 +19,7 @@ import logging
 import re
 import sys
 from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 import pdfplumber
 from openpyxl import Workbook
@@ -34,13 +35,15 @@ NUM = rf"\d{{1,3}}(?:{_SP}\d{{3}})*,\d{{2}}"
 DATE = r"\d{2}/\d{2}/\d{2,4}"
 
 
-def find(pattern, text, group=1, flags=re.IGNORECASE):
+# ---- Common Utilities ----
+
+def find(pattern: str, text: str, group: int = 1, flags: re.RegexFlag = re.IGNORECASE) -> str:
     """Return captured group of first match, or '' if none."""
     m = re.search(pattern, text, flags)
     return m.group(group).strip() if m else ""
 
 
-def clean_num(s):
+def clean_num(s: str) -> str:
     """Normalize a French amount to a plain string '7842.25' (or '' if empty)."""
     if not s:
         return ""
@@ -49,144 +52,248 @@ def clean_num(s):
     return s.replace(",", ".")
 
 
-# ---- Field columns per type (order = spreadsheet column order) ----
-COLUMNS_A = [
-    "Fichier", "N_FACTURE", "Date", "N_CLIENT", "PRELEVEMENT_ECHEANCE",
-    "TOTAUX_Mts_PUBLIC_TTC", "TOTAUX_Mts_MARCH_HTVA", "TOTAUX_Mts_TVA",
-    "MONTANT_A_PAYER", "Validation_Status", "Notes",
-]
-COLUMNS_B = [
-    "Fichier", "Livre_a", "FACTURE_N", "Date_facture", "Date_echeance",
-    "Montant_brut_hors_tva", "Montant_TVA", "Montant_a_payer",
-    "Validation_Status", "Notes",
-]
+# ---- Base Parser and Registry ----
+
+class BaseParser:
+    """Base class for all invoice parsers."""
+
+    def detect(self, page1_text: str) -> bool:
+        """Return True if this parser should handle the given invoice."""
+        raise NotImplementedError
+
+    def parse(self, pages_text: List[str], filename: str) -> Dict[str, Any]:
+        """Extract fields and return dictionary of properties."""
+        raise NotImplementedError
+
+    @property
+    def columns(self) -> List[str]:
+        """List of output Excel columns for this invoice type."""
+        raise NotImplementedError
+
+    @property
+    def sheet_name(self) -> str:
+        """Name of the Excel sheet to save this invoice type's results."""
+        raise NotImplementedError
 
 
-def parse_type_a(pages_text, filename):
-    """DISTRIBUTION FRANPRIX / Grid layout."""
-    # Header row on page 1: FACTURE(4-10d) DATE(dd/mm/yy) CLIENT(4-10d)
-    hdr = re.search(rf"(\d{{4,10}})\s+({DATE})\s+(\d{{4,10}})", pages_text[0])
-    n_facture = hdr.group(1) if hdr else ""
-    date = hdr.group(2) if hdr else ""
-    n_client = hdr.group(3) if hdr else ""
+class ParserRegistry:
+    """Registry to keep track of invoice parsers."""
 
-    if not n_facture:
-        logger.warning("[%s] Field 'N_FACTURE' could not be parsed", filename)
-    if not date:
-        logger.warning("[%s] Field 'Date' could not be parsed", filename)
-    if not n_client:
-        logger.warning("[%s] Field 'N_CLIENT' could not be parsed", filename)
+    def __init__(self) -> None:
+        self._parsers: Dict[str, BaseParser] = {}
 
-    echeance = ""
-    for txt in pages_text:
-        echeance = find(rf"PRELEVEMENT ECHEANCE\s+({DATE})", txt)
-        if echeance:
-            break
+    def register(self, name: str, parser: BaseParser) -> None:
+        """Register a new invoice parser."""
+        self._parsers[name] = parser
 
-    # Search all pages for totals.
-    totals_page_text = ""
-    for txt in pages_text:
-        if "TOTAUX" in txt or "POIDS LIVRE" in txt:
-            totals_page_text = txt
-            break
-    if not totals_page_text:
-        totals_page_text = pages_text[-1]
+    def get_all(self) -> Dict[str, BaseParser]:
+        """Get all registered parsers."""
+        return self._parsers
 
-    tot_line = find(r"(TOTAUX\s+.*)", totals_page_text)
-    tot_vals = re.findall(NUM, tot_line) if tot_line else []
-    
-    if len(tot_vals) >= 3:
-        public_ttc = clean_num(tot_vals[0])
-        march_htva = clean_num(tot_vals[1])
-        tva = clean_num(tot_vals[2])
-    elif len(tot_vals) == 2:
-        public_ttc = ""
-        march_htva = clean_num(tot_vals[0])
-        tva = clean_num(tot_vals[1])
-    elif len(tot_vals) == 1:
-        public_ttc = ""
-        march_htva = clean_num(tot_vals[0])
-        tva = ""
-    else:
-        public_ttc = ""
-        march_htva = ""
-        tva = ""
-
-    montant = clean_num(find(rf"({NUM}){_SP}*POIDS LIVRE", totals_page_text))
-    if not montant:
-        # Fallback to finding MONTANT A PAYER / P.A.Y.E.R
-        m = re.search(r"MONTANT\s+A\s*(?:P\.A\.Y\.E\.R|PAYER)", totals_page_text, re.IGNORECASE)
-        if m:
-            start_pos = m.end()
-            m_num = re.search(rf"({NUM})", totals_page_text[start_pos:])
-            if m_num:
-                montant = clean_num(m_num.group(1))
-
-    if not montant:
-        logger.warning("[%s] Field 'MONTANT_A_PAYER' could not be parsed", filename)
-
-    return {
-        "Fichier": filename, "N_FACTURE": n_facture, "Date": date,
-        "N_CLIENT": n_client, "PRELEVEMENT_ECHEANCE": echeance,
-        "TOTAUX_Mts_PUBLIC_TTC": public_ttc, "TOTAUX_Mts_MARCH_HTVA": march_htva,
-        "TOTAUX_Mts_TVA": tva, "MONTANT_A_PAYER": montant,
-    }
+    def detect_and_process(self, pages_text: List[str], filename: str) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[BaseParser]]:
+        """Find the matching parser, run parse, and return (name, row_dict, parser)."""
+        if not pages_text:
+            return None, None, None
+        for name, parser in self._parsers.items():
+            if parser.detect(pages_text[0]):
+                return name, parser.parse(pages_text, filename), parser
+        return None, None, None
 
 
-def parse_type_b(pages_text, filename):
-    """SEDIFRAIS / List layout."""
-    p1 = pages_text[0]
-    livre_a = find(r"Livré à\s*:?\s*(\d+)", p1)
-    facture_n = find(r"N°\s*:?\s*(\d+)", p1)
-    date_facture = find(rf"Date\s+facture\s*:?\s*({DATE})", p1)
-    date_echeance = find(rf"Date\s+échéance\s*:?\s*({DATE})", p1)
-
-    if not facture_n:
-        logger.warning("[%s] Field 'FACTURE_N' could not be parsed", filename)
-    if not date_facture:
-        logger.warning("[%s] Field 'Date_facture' could not be parsed", filename)
-
-    # Search all pages for totals.
-    totals_page_text = ""
-    for txt in pages_text:
-        if "Montant à payer" in txt or "Montant brut hors tva" in txt:
-            totals_page_text = txt
-            break
-    if not totals_page_text:
-        totals_page_text = pages_text[-1]
-
-    brut = clean_num(find(rf"Montant brut hors tva\s+({NUM})", totals_page_text))
-    tva = clean_num(find(rf"Montant TVA\s+({NUM})", totals_page_text))
-    a_payer = clean_num(find(rf"Montant à payer\s+({NUM})", totals_page_text))
-
-    if not a_payer:
-        logger.warning("[%s] Field 'Montant_a_payer' could not be parsed", filename)
-
-    return {
-        "Fichier": filename, "Livre_a": livre_a, "FACTURE_N": facture_n,
-        "Date_facture": date_facture, "Date_echeance": date_echeance,
-        "Montant_brut_hors_tva": brut, "Montant_TVA": tva,
-        "Montant_a_payer": a_payer,
-    }
+# Global registry instance
+registry = ParserRegistry()
 
 
-def detect_type(page1_text):
-    """
-    Decide Layout Type ('A' or 'B') based on layout structure markers.
-    - Layout A (Grid): contains 'FACTURE REFERENCE INTERNE' or 'Mts PUBLIC'
-    - Layout B (List): contains 'Montant brut hors tva' or 'Date facture' or 'Livré à'
-    """
-    if "FACTURE REFERENCE INTERNE" in page1_text or "Mts PUBLIC" in page1_text:
+def register_parser(name: str, parser: BaseParser) -> None:
+    """API function to register new invoice types."""
+    registry.register(name, parser)
+
+
+# ---- Concrete Parsers ----
+
+class TypeAParser(BaseParser):
+    """DISTRIBUTION FRANPRIX / Grid layout parser."""
+
+    @property
+    def sheet_name(self) -> str:
+        return "TypeA"
+
+    @property
+    def columns(self) -> List[str]:
+        return [
+            "Fichier", "N_FACTURE", "Date", "N_CLIENT", "PRELEVEMENT_ECHEANCE",
+            "TOTAUX_Mts_PUBLIC_TTC", "TOTAUX_Mts_MARCH_HTVA", "TOTAUX_Mts_TVA",
+            "MONTANT_A_PAYER", "Validation_Status", "Notes",
+        ]
+
+    def detect(self, page1_text: str) -> bool:
+        return "FACTURE REFERENCE INTERNE" in page1_text or "Mts PUBLIC" in page1_text
+
+    def parse(self, pages_text: List[str], filename: str) -> Dict[str, Any]:
+        # Header row on page 1: FACTURE(4-10d) DATE(dd/mm/yy) CLIENT(4-10d)
+        hdr = re.search(rf"(\d{{4,10}})\s+({DATE})\s+(\d{{4,10}})", pages_text[0])
+        n_facture = hdr.group(1) if hdr else ""
+        date = hdr.group(2) if hdr else ""
+        n_client = hdr.group(3) if hdr else ""
+
+        if not n_facture:
+            logger.warning("[%s] Field 'N_FACTURE' could not be parsed", filename)
+        if not date:
+            logger.warning("[%s] Field 'Date' could not be parsed", filename)
+        if not n_client:
+            logger.warning("[%s] Field 'N_CLIENT' could not be parsed", filename)
+
+        echeance = ""
+        for txt in pages_text:
+            echeance = find(rf"PRELEVEMENT ECHEANCE\s+({DATE})", txt)
+            if echeance:
+                break
+
+        # Search all pages for totals.
+        totals_page_text = ""
+        for txt in pages_text:
+            if "TOTAUX" in txt or "POIDS LIVRE" in txt:
+                totals_page_text = txt
+                break
+        if not totals_page_text:
+            totals_page_text = pages_text[-1]
+
+        tot_line = find(r"(TOTAUX\s+.*)", totals_page_text)
+        tot_vals = re.findall(NUM, tot_line) if tot_line else []
+        
+        if len(tot_vals) >= 3:
+            public_ttc = clean_num(tot_vals[0])
+            march_htva = clean_num(tot_vals[1])
+            tva = clean_num(tot_vals[2])
+        elif len(tot_vals) == 2:
+            public_ttc = ""
+            march_htva = clean_num(tot_vals[0])
+            tva = clean_num(tot_vals[1])
+        elif len(tot_vals) == 1:
+            public_ttc = ""
+            march_htva = clean_num(tot_vals[0])
+            tva = ""
+        else:
+            public_ttc = ""
+            march_htva = ""
+            tva = ""
+
+        montant = clean_num(find(rf"({NUM}){_SP}*POIDS LIVRE", totals_page_text))
+        if not montant:
+            # Fallback to finding MONTANT A PAYER / P.A.Y.E.R
+            m = re.search(r"MONTANT\s+A\s*(?:P\.A\.Y\.E\.R|PAYER)", totals_page_text, re.IGNORECASE)
+            if m:
+                start_pos = m.end()
+                m_num = re.search(rf"({NUM})", totals_page_text[start_pos:])
+                if m_num:
+                    montant = clean_num(m_num.group(1))
+
+        if not montant:
+            logger.warning("[%s] Field 'MONTANT_A_PAYER' could not be parsed", filename)
+
+        return {
+            "Fichier": filename,
+            "N_FACTURE": n_facture,
+            "Date": date,
+            "N_CLIENT": n_client,
+            "PRELEVEMENT_ECHEANCE": echeance,
+            "TOTAUX_Mts_PUBLIC_TTC": public_ttc,
+            "TOTAUX_Mts_MARCH_HTVA": march_htva,
+            "TOTAUX_Mts_TVA": tva,
+            "MONTANT_A_PAYER": montant,
+        }
+
+
+class TypeBParser(BaseParser):
+    """SEDIFRAIS / List layout parser."""
+
+    @property
+    def sheet_name(self) -> str:
+        return "TypeB"
+
+    @property
+    def columns(self) -> List[str]:
+        return [
+            "Fichier", "Livre_a", "FACTURE_N", "Date_facture", "Date_echeance",
+            "Montant_brut_hors_tva", "Montant_TVA", "Montant_a_payer",
+            "Validation_Status", "Notes",
+        ]
+
+    def detect(self, page1_text: str) -> bool:
+        return "Montant brut hors tva" in page1_text or "Date facture" in page1_text or "Livré à" in page1_text
+
+    def parse(self, pages_text: List[str], filename: str) -> Dict[str, Any]:
+        p1 = pages_text[0]
+        livre_a = find(r"Livré à\s*:?\s*(\d+)", p1)
+        facture_n = find(r"N°\s*:?\s*(\d+)", p1)
+        date_facture = find(rf"Date\s+facture\s*:?\s*({DATE})", p1)
+        date_echeance = find(rf"Date\s+échéance\s*:?\s*({DATE})", p1)
+
+        if not facture_n:
+            logger.warning("[%s] Field 'FACTURE_N' could not be parsed", filename)
+        if not date_facture:
+            logger.warning("[%s] Field 'Date_facture' could not be parsed", filename)
+
+        # Search all pages for totals.
+        totals_page_text = ""
+        for txt in pages_text:
+            if "Montant à payer" in txt or "Montant brut hors tva" in txt:
+                totals_page_text = txt
+                break
+        if not totals_page_text:
+            totals_page_text = pages_text[-1]
+
+        brut = clean_num(find(rf"Montant brut hors tva\s+({NUM})", totals_page_text))
+        tva = clean_num(find(rf"Montant TVA\s+({NUM})", totals_page_text))
+        a_payer = clean_num(find(rf"Montant à payer\s+({NUM})", totals_page_text))
+
+        if not a_payer:
+            logger.warning("[%s] Field 'Montant_a_payer' could not be parsed", filename)
+
+        return {
+            "Fichier": filename,
+            "Livre_a": livre_a,
+            "FACTURE_N": facture_n,
+            "Date_facture": date_facture,
+            "Date_echeance": date_echeance,
+            "Montant_brut_hors_tva": brut,
+            "Montant_TVA": tva,
+            "Montant_a_payer": a_payer,
+        }
+
+
+# Register defaults
+registry.register("TypeA", TypeAParser())
+registry.register("TypeB", TypeBParser())
+
+
+# ---- Legacy / Compatibility Helpers ----
+
+def detect_type(page1_text: str) -> Optional[str]:
+    """Helper for backward compatibility."""
+    if registry.get_all()["TypeA"].detect(page1_text):
         return "A"
-    if "Montant brut hors tva" in page1_text or "Date facture" in page1_text or "Livré à" in page1_text:
+    if registry.get_all()["TypeB"].detect(page1_text):
         return "B"
     return None
 
 
-def process(path):
-    """Extract one PDF. Returns (type, row_dict) or (None, None) if unknown."""
+def parse_type_a(pages_text: List[str], filename: str) -> Dict[str, Any]:
+    """Helper for backward compatibility."""
+    return registry.get_all()["TypeA"].parse(pages_text, filename)
+
+
+def parse_type_b(pages_text: List[str], filename: str) -> Dict[str, Any]:
+    """Helper for backward compatibility."""
+    return registry.get_all()["TypeB"].parse(pages_text, filename)
+
+
+# ---- Main Pipeline Functions ----
+
+def process(path: Path) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Extract one PDF. Returns (type_name, row_dict) or (None, None) if unknown."""
     name = Path(path).name
-    pages_text = []
+    pages_text: List[str] = []
     
     with pdfplumber.open(path) as pdf:
         if not pdf.pages:
@@ -203,34 +310,32 @@ def process(path):
         logger.warning("[%s] No text extracted from any page of the PDF", name)
         return None, None
 
-    kind = detect_type(pages_text[0])
-    if kind == "A":
-        return "A", parse_type_a(pages_text, name)
-    if kind == "B":
-        return "B", parse_type_b(pages_text, name)
+    kind_name, row, _ = registry.detect_and_process(pages_text, name)
+    if kind_name and row:
+        return kind_name, row
     
     logger.warning("[%s] Unknown invoice layout. Could not determine type A or B", name)
     return None, None
 
 
-def write_xlsx(rows_a, rows_b, out_path):
+def write_xlsx(results: Dict[str, List[Dict[str, Any]]], out_path: str) -> None:
     wb = Workbook()
     wb.remove(wb.active)  # drop default sheet
-    for title, cols, rows in [("TypeA", COLUMNS_A, rows_a),
-                              ("TypeB", COLUMNS_B, rows_b)]:
-        ws = wb.create_sheet(title)
-        ws.append(cols)
+    for name, parser in registry.get_all().items():
+        ws = wb.create_sheet(parser.sheet_name)
+        ws.append(parser.columns)
+        rows = results.get(name, [])
         for r in rows:
-            ws.append([r.get(c, "") for c in cols])
+            ws.append([r.get(c, "") for c in parser.columns])
     wb.save(out_path)
 
 
-def discover_files(inputs, batch_folders=None, recursive=False):
+def discover_files(inputs: List[str], batch_folders: Optional[List[str]] = None, recursive: bool = False) -> List[Path]:
     """Scan and resolve all unique PDF files based on inputs and batch folders."""
-    files = []
-    seen = set()
+    files: List[Path] = []
+    seen: Set[Path] = set()
 
-    def add_file(path):
+    def add_file(path: Path) -> None:
         try:
             resolved = Path(path).resolve()
             if resolved not in seen:
@@ -241,7 +346,7 @@ def discover_files(inputs, batch_folders=None, recursive=False):
                 seen.add(path)
                 files.append(Path(path))
 
-    def scan_dir(dir_path):
+    def scan_dir(dir_path: Path) -> None:
         pattern = "*.[pP][dD][fF]"
         if recursive:
             for p in Path(dir_path).rglob(pattern):
@@ -252,7 +357,7 @@ def discover_files(inputs, batch_folders=None, recursive=False):
                 if p.is_file():
                     add_file(p)
 
-    targets = []
+    targets: List[Any] = []
     if inputs:
         targets.extend(inputs)
     if batch_folders:
@@ -285,20 +390,20 @@ def discover_files(inputs, batch_folders=None, recursive=False):
     return files
 
 
-def validate_invoice(kind, row):
+def validate_invoice(kind: str, row: Dict[str, Any]) -> Tuple[str, str]:
     """
     Validate the parsed row data.
     Returns (status, notes) where status is 'VALID' or 'SUSPICIOUS' and notes is a string.
     """
     status = "VALID"
-    notes = []
+    notes: List[str] = []
 
-    def is_valid_date(d_str):
+    def is_valid_date(d_str: str) -> bool:
         if not d_str:
             return False
         return bool(re.match(r"^\d{2}/\d{2}/\d{2,4}$", d_str))
 
-    def is_valid_amount(a_str):
+    def is_valid_amount(a_str: str) -> bool:
         if not a_str:
             return False
         try:
@@ -307,7 +412,7 @@ def validate_invoice(kind, row):
         except ValueError:
             return False
 
-    if kind == "A":
+    if kind == "TypeA":
         req_fields = ["N_FACTURE", "Date", "N_CLIENT", "MONTANT_A_PAYER"]
         for f in req_fields:
             if not row.get(f):
@@ -353,7 +458,7 @@ def validate_invoice(kind, row):
             except ValueError:
                 pass
 
-    elif kind == "B":
+    elif kind == "TypeB":
         req_fields = ["FACTURE_N", "Date_facture", "Montant_a_payer"]
         for f in req_fields:
             if not row.get(f):
@@ -403,7 +508,7 @@ def validate_invoice(kind, row):
     return status, notes_str
 
 
-def main(argv=None):
+def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Extract invoice fields to Excel.")
     ap.add_argument("inputs", nargs="*", help="PDF file(s), folder(s), or glob pattern(s)")
     ap.add_argument("-b", "--batch", "--folder", nargs="+", dest="batch_folders", help="Folder(s) to scan for PDF files automatically")
@@ -440,33 +545,26 @@ def main(argv=None):
         logger.error("No PDF files were discovered for processing.")
         sys.exit(1)
 
-    rows_a, rows_b = [], []
+    results: Dict[str, List[Dict[str, Any]]] = {name: [] for name in registry.get_all().keys()}
     for p in pdf_paths:
         try:
-            kind, row = process(p)
-            if kind == "A":
-                status, notes = validate_invoice(kind, row)
+            kind_name, row = process(p)
+            if kind_name and row:
+                status, notes = validate_invoice(kind_name, row)
                 row["Validation_Status"] = status
                 row["Notes"] = notes
-                rows_a.append(row)
+                results[kind_name].append(row)
                 if status == "SUSPICIOUS":
-                    logger.warning("Processed Type A invoice (SUSPICIOUS): %s -> %s. Notes: %s", p.name, row, notes)
+                    logger.warning("Processed %s invoice (SUSPICIOUS): %s -> %s. Notes: %s", kind_name, p.name, row, notes)
                 else:
-                    logger.info("Processed Type A invoice: %s -> %s", p.name, row)
-            elif kind == "B":
-                status, notes = validate_invoice(kind, row)
-                row["Validation_Status"] = status
-                row["Notes"] = notes
-                rows_b.append(row)
-                if status == "SUSPICIOUS":
-                    logger.warning("Processed Type B invoice (SUSPICIOUS): %s -> %s. Notes: %s", p.name, row, notes)
-                else:
-                    logger.info("Processed Type B invoice: %s -> %s", p.name, row)
+                    logger.info("Processed %s invoice: %s -> %s", kind_name, p.name, row)
         except Exception as e:
             logger.error("Failed to process invoice %s: %s", p.name, e, exc_info=True)
 
-    write_xlsx(rows_a, rows_b, args.output)
-    logger.info("Wrote %d TypeA + %d TypeB row(s) -> %s", len(rows_a), len(rows_b), args.output)
+    write_xlsx(results, args.output)
+    
+    total_written_msg = " + ".join(f"{len(rows)} {name}" for name, rows in results.items())
+    logger.info("Wrote %s row(s) -> %s", total_written_msg, args.output)
 
 
 if __name__ == "__main__":
