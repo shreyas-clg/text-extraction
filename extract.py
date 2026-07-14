@@ -34,7 +34,7 @@ NUM = rf"\d{{1,3}}(?:{_SP}\d{{3}})*,\d{{2}}"
 DATE = r"\d{2}/\d{2}/\d{2,4}"
 
 
-def find(pattern, text, group=1, flags=0):
+def find(pattern, text, group=1, flags=re.IGNORECASE):
     """Return captured group of first match, or '' if none."""
     m = re.search(pattern, text, flags)
     return m.group(group).strip() if m else ""
@@ -53,18 +53,19 @@ def clean_num(s):
 COLUMNS_A = [
     "Fichier", "N_FACTURE", "Date", "N_CLIENT", "PRELEVEMENT_ECHEANCE",
     "TOTAUX_Mts_PUBLIC_TTC", "TOTAUX_Mts_MARCH_HTVA", "TOTAUX_Mts_TVA",
-    "MONTANT_A_PAYER",
+    "MONTANT_A_PAYER", "Validation_Status", "Notes",
 ]
 COLUMNS_B = [
     "Fichier", "Livre_a", "FACTURE_N", "Date_facture", "Date_echeance",
     "Montant_brut_hors_tva", "Montant_TVA", "Montant_a_payer",
+    "Validation_Status", "Notes",
 ]
 
 
 def parse_type_a(pages_text, filename):
-    """DISTRIBUTION FRANPRIX."""
-    # Header row on page 1: FACTURE(6d) DATE(dd/mm/yy) CLIENT(6d)
-    hdr = re.search(rf"(\d{{6}})\s+({DATE})\s+(\d{{6}})", pages_text[0])
+    """DISTRIBUTION FRANPRIX / Grid layout."""
+    # Header row on page 1: FACTURE(4-10d) DATE(dd/mm/yy) CLIENT(4-10d)
+    hdr = re.search(rf"(\d{{4,10}})\s+({DATE})\s+(\d{{4,10}})", pages_text[0])
     n_facture = hdr.group(1) if hdr else ""
     date = hdr.group(2) if hdr else ""
     n_client = hdr.group(3) if hdr else ""
@@ -76,15 +77,50 @@ def parse_type_a(pages_text, filename):
     if not n_client:
         logger.warning("[%s] Field 'N_CLIENT' could not be parsed", filename)
 
-    # Totals live on the last page.
-    last = pages_text[-1]
-    echeance = find(rf"PRELEVEMENT ECHEANCE\s+({DATE})", last)
-    tot = re.search(rf"TOTAUX\s+({NUM})\s+({NUM})\s+({NUM})", last)
-    public_ttc = clean_num(tot.group(1)) if tot else ""
-    march_htva = clean_num(tot.group(2)) if tot else ""
-    tva = clean_num(tot.group(3)) if tot else ""
-    # MONTANT A PAYER = amount immediately before "POIDS LIVRE".
-    montant = clean_num(find(rf"({NUM}){_SP}*POIDS LIVRE", last))
+    echeance = ""
+    for txt in pages_text:
+        echeance = find(rf"PRELEVEMENT ECHEANCE\s+({DATE})", txt)
+        if echeance:
+            break
+
+    # Search all pages for totals.
+    totals_page_text = ""
+    for txt in pages_text:
+        if "TOTAUX" in txt or "POIDS LIVRE" in txt:
+            totals_page_text = txt
+            break
+    if not totals_page_text:
+        totals_page_text = pages_text[-1]
+
+    tot_line = find(r"(TOTAUX\s+.*)", totals_page_text)
+    tot_vals = re.findall(NUM, tot_line) if tot_line else []
+    
+    if len(tot_vals) >= 3:
+        public_ttc = clean_num(tot_vals[0])
+        march_htva = clean_num(tot_vals[1])
+        tva = clean_num(tot_vals[2])
+    elif len(tot_vals) == 2:
+        public_ttc = ""
+        march_htva = clean_num(tot_vals[0])
+        tva = clean_num(tot_vals[1])
+    elif len(tot_vals) == 1:
+        public_ttc = ""
+        march_htva = clean_num(tot_vals[0])
+        tva = ""
+    else:
+        public_ttc = ""
+        march_htva = ""
+        tva = ""
+
+    montant = clean_num(find(rf"({NUM}){_SP}*POIDS LIVRE", totals_page_text))
+    if not montant:
+        # Fallback to finding MONTANT A PAYER / P.A.Y.E.R
+        m = re.search(r"MONTANT\s+A\s*(?:P\.A\.Y\.E\.R|PAYER)", totals_page_text, re.IGNORECASE)
+        if m:
+            start_pos = m.end()
+            m_num = re.search(rf"({NUM})", totals_page_text[start_pos:])
+            if m_num:
+                montant = clean_num(m_num.group(1))
 
     if not montant:
         logger.warning("[%s] Field 'MONTANT_A_PAYER' could not be parsed", filename)
@@ -98,23 +134,30 @@ def parse_type_a(pages_text, filename):
 
 
 def parse_type_b(pages_text, filename):
-    """SEDIFRAIS."""
+    """SEDIFRAIS / List layout."""
     p1 = pages_text[0]
-    livre_a = find(r"Livré à\s*:\s*(\d+)", p1)
-    facture_n = find(r"N°\s*(\d+)", p1)
-    date_facture = find(rf"Date facture\s*:\s*({DATE})", p1)
-    date_echeance = find(rf"Date échéance\s*:\s*({DATE})", p1)
+    livre_a = find(r"Livré à\s*:?\s*(\d+)", p1)
+    facture_n = find(r"N°\s*:?\s*(\d+)", p1)
+    date_facture = find(rf"Date\s+facture\s*:?\s*({DATE})", p1)
+    date_echeance = find(rf"Date\s+échéance\s*:?\s*({DATE})", p1)
 
     if not facture_n:
         logger.warning("[%s] Field 'FACTURE_N' could not be parsed", filename)
     if not date_facture:
         logger.warning("[%s] Field 'Date_facture' could not be parsed", filename)
 
-    # Totals block (last page).
-    last = pages_text[-1]
-    brut = clean_num(find(rf"Montant brut hors tva\s+({NUM})", last))
-    tva = clean_num(find(rf"Montant TVA\s+({NUM})", last))
-    a_payer = clean_num(find(rf"Montant à payer\s+({NUM})", last))
+    # Search all pages for totals.
+    totals_page_text = ""
+    for txt in pages_text:
+        if "Montant à payer" in txt or "Montant brut hors tva" in txt:
+            totals_page_text = txt
+            break
+    if not totals_page_text:
+        totals_page_text = pages_text[-1]
+
+    brut = clean_num(find(rf"Montant brut hors tva\s+({NUM})", totals_page_text))
+    tva = clean_num(find(rf"Montant TVA\s+({NUM})", totals_page_text))
+    a_payer = clean_num(find(rf"Montant à payer\s+({NUM})", totals_page_text))
 
     if not a_payer:
         logger.warning("[%s] Field 'Montant_a_payer' could not be parsed", filename)
@@ -128,11 +171,14 @@ def parse_type_b(pages_text, filename):
 
 
 def detect_type(page1_text):
-    """Return 'A', 'B', or None. Decide on page 1 only - the CGV pages of a
-    SEDIFRAIS invoice also mention FRANPRIX, so whole-doc matching is unsafe."""
-    if "DISTRIBUTION FRANPRIX" in page1_text:
+    """
+    Decide Layout Type ('A' or 'B') based on layout structure markers.
+    - Layout A (Grid): contains 'FACTURE REFERENCE INTERNE' or 'Mts PUBLIC'
+    - Layout B (List): contains 'Montant brut hors tva' or 'Date facture' or 'Livré à'
+    """
+    if "FACTURE REFERENCE INTERNE" in page1_text or "Mts PUBLIC" in page1_text:
         return "A"
-    if "SEDIFRAIS" in page1_text:
+    if "Montant brut hors tva" in page1_text or "Date facture" in page1_text or "Livré à" in page1_text:
         return "B"
     return None
 
@@ -239,6 +285,124 @@ def discover_files(inputs, batch_folders=None, recursive=False):
     return files
 
 
+def validate_invoice(kind, row):
+    """
+    Validate the parsed row data.
+    Returns (status, notes) where status is 'VALID' or 'SUSPICIOUS' and notes is a string.
+    """
+    status = "VALID"
+    notes = []
+
+    def is_valid_date(d_str):
+        if not d_str:
+            return False
+        return bool(re.match(r"^\d{2}/\d{2}/\d{2,4}$", d_str))
+
+    def is_valid_amount(a_str):
+        if not a_str:
+            return False
+        try:
+            val = float(a_str)
+            return val >= 0
+        except ValueError:
+            return False
+
+    if kind == "A":
+        req_fields = ["N_FACTURE", "Date", "N_CLIENT", "MONTANT_A_PAYER"]
+        for f in req_fields:
+            if not row.get(f):
+                status = "SUSPICIOUS"
+                notes.append(f"Missing required field {f}")
+
+        d = row.get("Date")
+        if d and not is_valid_date(d):
+            status = "SUSPICIOUS"
+            notes.append(f"Invalid date format: {d}")
+
+        echeance = row.get("PRELEVEMENT_ECHEANCE")
+        if echeance and not is_valid_date(echeance):
+            status = "SUSPICIOUS"
+            notes.append(f"Invalid echeance date format: {echeance}")
+
+        amt_fields = ["TOTAUX_Mts_PUBLIC_TTC", "TOTAUX_Mts_MARCH_HTVA", "TOTAUX_Mts_TVA", "MONTANT_A_PAYER"]
+        for f in amt_fields:
+            val = row.get(f)
+            if val and not is_valid_amount(val):
+                status = "SUSPICIOUS"
+                notes.append(f"Invalid amount format in {f}: {val}")
+
+        pay_str = row.get("MONTANT_A_PAYER")
+        if pay_str:
+            try:
+                pay_val = float(pay_str)
+                if pay_val > 1000000:
+                    status = "SUSPICIOUS"
+                    notes.append(f"Suspiciously high amount: {pay_val}")
+            except ValueError:
+                pass
+
+        htva_str = row.get("TOTAUX_Mts_MARCH_HTVA")
+        tva_str = row.get("TOTAUX_Mts_TVA")
+        if htva_str and tva_str and pay_str:
+            try:
+                htva = float(htva_str)
+                tva = float(tva_str)
+                pay = float(pay_str)
+                if abs((htva + tva) - pay) > 5.00:
+                    notes.append(f"Math check: HTVA ({htva}) + TVA ({tva}) != PAYER ({pay})")
+            except ValueError:
+                pass
+
+    elif kind == "B":
+        req_fields = ["FACTURE_N", "Date_facture", "Montant_a_payer"]
+        for f in req_fields:
+            if not row.get(f):
+                status = "SUSPICIOUS"
+                notes.append(f"Missing required field {f}")
+
+        d = row.get("Date_facture")
+        if d and not is_valid_date(d):
+            status = "SUSPICIOUS"
+            notes.append(f"Invalid date format: {d}")
+
+        echeance = row.get("Date_echeance")
+        if echeance and not is_valid_date(echeance):
+            status = "SUSPICIOUS"
+            notes.append(f"Invalid echeance date format: {echeance}")
+
+        amt_fields = ["Montant_brut_hors_tva", "Montant_TVA", "Montant_a_payer"]
+        for f in amt_fields:
+            val = row.get(f)
+            if val and not is_valid_amount(val):
+                status = "SUSPICIOUS"
+                notes.append(f"Invalid amount format in {f}: {val}")
+
+        pay_str = row.get("Montant_a_payer")
+        if pay_str:
+            try:
+                pay_val = float(pay_str)
+                if pay_val > 1000000:
+                    status = "SUSPICIOUS"
+                    notes.append(f"Suspiciously high amount: {pay_val}")
+            except ValueError:
+                pass
+
+        ht_str = row.get("Montant_brut_hors_tva")
+        tva_str = row.get("Montant_TVA")
+        if ht_str and tva_str and pay_str:
+            try:
+                ht = float(ht_str)
+                tva = float(tva_str)
+                pay = float(pay_str)
+                if abs((ht + tva) - pay) > 5.00:
+                    notes.append(f"Math check: HT ({ht}) + TVA ({tva}) != PAYER ({pay})")
+            except ValueError:
+                pass
+
+    notes_str = "; ".join(notes)
+    return status, notes_str
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Extract invoice fields to Excel.")
     ap.add_argument("inputs", nargs="*", help="PDF file(s), folder(s), or glob pattern(s)")
@@ -281,11 +445,23 @@ def main(argv=None):
         try:
             kind, row = process(p)
             if kind == "A":
+                status, notes = validate_invoice(kind, row)
+                row["Validation_Status"] = status
+                row["Notes"] = notes
                 rows_a.append(row)
-                logger.info("Processed Type A invoice: %s -> %s", p.name, row)
+                if status == "SUSPICIOUS":
+                    logger.warning("Processed Type A invoice (SUSPICIOUS): %s -> %s. Notes: %s", p.name, row, notes)
+                else:
+                    logger.info("Processed Type A invoice: %s -> %s", p.name, row)
             elif kind == "B":
+                status, notes = validate_invoice(kind, row)
+                row["Validation_Status"] = status
+                row["Notes"] = notes
                 rows_b.append(row)
-                logger.info("Processed Type B invoice: %s -> %s", p.name, row)
+                if status == "SUSPICIOUS":
+                    logger.warning("Processed Type B invoice (SUSPICIOUS): %s -> %s. Notes: %s", p.name, row, notes)
+                else:
+                    logger.info("Processed Type B invoice: %s -> %s", p.name, row)
         except Exception as e:
             logger.error("Failed to process invoice %s: %s", p.name, e, exc_info=True)
 
